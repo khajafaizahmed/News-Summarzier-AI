@@ -1,11 +1,11 @@
 streamlit>=1.32,<1.37
 newspaper3k
 transformers==4.41.*
-torch==2.1.*
+torch>=2.5,<2.9        #  works with Py 3.13
 gTTS
-moviepy==1.0.3
+moviepy==2.0.*         #  compatible with NumPy 2.x
 imageio-ffmpeg
 pillow
-numpy<2.0
+numpy>=2.0             #  Py 3.13 needs NumPy 2.x
 feedparser
 nltk
