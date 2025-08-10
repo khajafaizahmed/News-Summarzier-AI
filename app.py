@@ -3,11 +3,13 @@ import io
 import gc
 import uuid
 import random
+import time
 from datetime import datetime
 
 import streamlit as st
 import feedparser
 import numpy as np
+import requests
 from newspaper import Article, Config
 try:
     from transformers.pipelines import pipeline
@@ -158,6 +160,21 @@ def summary_image(summary, size=(1280, 720), margin=80):
     buf.seek(0)
     return buf
 
+def fetch_html_with_retry(url, retries=2, timeout=20):
+    """Fallback fetch for sites that timeout with newspaper.download()."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; News2VideoBot/1.0; +https://streamlit.app)"
+    }
+    for i in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                return resp.text
+        except requests.RequestException:
+            pass
+        time.sleep(1.5 * (i + 1))  # simple backoff
+    return None
+
 def process_article(url, label):
     """
     Scrape, summarize, TTS, and make video for an article.
@@ -165,19 +182,44 @@ def process_article(url, label):
     """
     try:
         cfg = Config()
-        cfg.request_timeout = 10
+        # NPR can be slow; give it more room
+        cfg.request_timeout = 20
         cfg.browser_user_agent = "Mozilla/5.0 (compatible; News2VideoBot/1.0)"
         article = Article(url, config=cfg)
-        article.download()
-        article.parse()
 
-        text = (article.text or "").strip()
+        text = ""
+        # First try: standard newspaper download/parse
+        try:
+            article.download()
+            article.parse()
+            text = (article.text or "").strip()
+        except Exception:
+            text = ""
+
+        # Fallback: requests + set_html + parse
+        if not text:
+            html = fetch_html_with_retry(url, retries=2, timeout=20)
+            if html:
+                try:
+                    article.set_html(html)
+                    article.parse()
+                    text = (article.text or "").strip()
+                except Exception:
+                    text = ""
+
         if not text:
             return None
-        # Guard against extremely long inputs (speed & truncation)
-        text = text[:4000]
 
-        summary = summarizer(text, max_length=120, min_length=40, do_sample=False)[0]["summary_text"]
+        # Keep summarizer snappy on short pieces
+        char_len = len(text)
+        if char_len < 600:
+            max_len, min_len = 60, 20
+        else:
+            max_len, min_len = 120, 40
+
+        summary = summarizer(
+            text[:4000], max_length=max_len, min_length=min_len, do_sample=False
+        )[0]["summary_text"]
 
         uid = uuid.uuid4().hex[:8]
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
@@ -197,22 +239,16 @@ def process_article(url, label):
 
         audio = AudioFileClip(audio_path)
         clip = ImageClip(frame).set_duration(audio.duration).set_audio(audio)
-
         clip.write_videofile(
-            video_path,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            verbose=False,
-            logger=None,
+            video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None
         )
 
-        # Cleanup
         audio.close()
         clip.close()
         gc.collect()
 
         return video_path, summary
+
     except Exception as e:
         st.warning(f"Error processing article: {e}")
         return None
