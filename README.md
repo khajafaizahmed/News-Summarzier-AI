@@ -14,7 +14,7 @@ A shareable **Streamlit** app that:
 
 ## 🚀 Local Run
 ```bash
-git clone https://github.com/YOUR_USERNAME/news-to-video-web.git
+https://github.com/khajafaizahmed/News-Summarzier-AI
 cd news-to-video-web
 pip install -r requirements.txt
 streamlit run app.py
