@@ -11,3 +11,4 @@ numpy<2.0              # required for moviepy 1.x
 feedparser
 nltk
 lxml_html_clean
+requests
