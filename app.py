@@ -4,6 +4,7 @@ import gc
 import uuid
 import random
 import time
+import re
 from datetime import datetime
 
 import streamlit as st
@@ -78,27 +79,107 @@ summarizer = load_summarizer()
 # --------------------
 # Helpers
 # --------------------
-def get_random_articles(category_feeds, count=3):
-    """Pick random, de-duplicated articles -> (link, title, source)."""
+DENY_URL_PATTERNS = [
+    r"/news/videos/",   # BBC video pages
+    r"/news/av/",       # BBC AV pages
+    r"/video/",         # generic video pages
+    r"/live/",          # live blogs
+]
+DENY_TEXT_SNIPPETS = [
+    "not responsible for the content of external",
+    "approach to external linking",
+]
+
+def looks_like_video_or_live(url: str) -> bool:
+    return any(re.search(p, url) for p in DENY_URL_PATTERNS)
+
+def is_viable_text(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 600:
+        return False
+    low = t.lower()
+    return not any(snip in low for snip in DENY_TEXT_SNIPPETS)
+
+def fetch_html_with_retry(url, retries=2, timeout=20):
+    """Fallback fetch for sites that timeout with newspaper.download()."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; News2VideoBot/1.0; +https://streamlit.app)"
+    }
+    for i in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                return resp.text
+        except requests.RequestException:
+            pass
+        time.sleep(1.5 * (i + 1))  # simple backoff
+    return None
+
+def fetch_text(url: str) -> str:
+    """Try newspaper3k first; if empty/timeout, retry with requests + set_html."""
+    cfg = Config()
+    cfg.request_timeout = 20
+    cfg.browser_user_agent = "Mozilla/5.0 (compatible; News2VideoBot/1.0)"
+    art = Article(url, config=cfg)
+
+    # First try: standard download/parse
+    t = ""
+    try:
+        art.download()
+        art.parse()
+        t = (art.text or "").strip()
+    except Exception:
+        t = ""
+
+    # Fallback: requests + set_html
+    if not t:
+        html = fetch_html_with_retry(url, retries=2, timeout=20)
+        if html:
+            try:
+                art.set_html(html)
+                art.parse()
+                t = (art.text or "").strip()
+            except Exception:
+                t = ""
+    return t
+
+def get_random_articles(category_feeds, count=3, max_checks=12):
+    """Return up to `count` valid articles (skip video/live/paywalled/external-link placeholders)."""
     picks, seen = [], set()
     feeds = list(category_feeds)
     random.shuffle(feeds)
+
     for feed_url in feeds:
         try:
             feed = feedparser.parse(feed_url)
-            if getattr(feed, "entries", []):
-                entry = random.choice(feed.entries)
-                link = getattr(entry, "link", "")
-                title = getattr(entry, "title", "Untitled")
-                source = getattr(feed.feed, "title", "Unknown Source")
-                if link and link not in seen:
-                    picks.append((link, title, source))
-                    seen.add(link)
+            entries = list(getattr(feed, "entries", []))
+            random.shuffle(entries)
         except Exception as e:
             st.warning(f"Feed error ({feed_url}): {e}")
+            continue
+
+        for entry in entries:
+            if len(picks) >= count or max_checks <= 0:
+                break
+
+            link = getattr(entry, "link", "")
+            title = getattr(entry, "title", "Untitled")
+            source = getattr(feed.feed, "title", "Unknown Source")
+
+            if not link or link in seen or looks_like_video_or_live(link):
+                continue
+
+            # Validate by fetching text quickly
+            text = fetch_text(link)
+            max_checks -= 1
+            if is_viable_text(text):
+                picks.append((link, title, source))
+                seen.add(link)
+
         if len(picks) >= count:
             break
-    return picks[:count]
+
+    return picks
 
 def wrap_text_to_fit(draw, text, font, max_width):
     """Wrap text into lines that fit within max_width."""
@@ -160,59 +241,19 @@ def summary_image(summary, size=(1280, 720), margin=80):
     buf.seek(0)
     return buf
 
-def fetch_html_with_retry(url, retries=2, timeout=20):
-    """Fallback fetch for sites that timeout with newspaper.download()."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; News2VideoBot/1.0; +https://streamlit.app)"
-    }
-    for i in range(retries + 1):
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            if resp.status_code == 200 and len(resp.text) > 500:
-                return resp.text
-        except requests.RequestException:
-            pass
-        time.sleep(1.5 * (i + 1))  # simple backoff
-    return None
-
 def process_article(url, label):
     """
     Scrape, summarize, TTS, and make video for an article.
     Returns (video_path, summary) or None.
     """
     try:
-        cfg = Config()
-        # NPR can be slow; give it more room
-        cfg.request_timeout = 20
-        cfg.browser_user_agent = "Mozilla/5.0 (compatible; News2VideoBot/1.0)"
-        article = Article(url, config=cfg)
-
-        text = ""
-        # First try: standard newspaper download/parse
-        try:
-            article.download()
-            article.parse()
-            text = (article.text or "").strip()
-        except Exception:
-            text = ""
-
-        # Fallback: requests + set_html + parse
-        if not text:
-            html = fetch_html_with_retry(url, retries=2, timeout=20)
-            if html:
-                try:
-                    article.set_html(html)
-                    article.parse()
-                    text = (article.text or "").strip()
-                except Exception:
-                    text = ""
-
-        if not text:
+        text = fetch_text(url)
+        if not is_viable_text(text):
             return None
 
-        # Keep summarizer snappy on short pieces
+        # Adjust summary length for short pieces
         char_len = len(text)
-        if char_len < 600:
+        if char_len < 800:
             max_len, min_len = 60, 20
         else:
             max_len, min_len = 120, 40
