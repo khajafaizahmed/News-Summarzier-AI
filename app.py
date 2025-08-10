@@ -9,7 +9,10 @@ import streamlit as st
 import feedparser
 import numpy as np
 from newspaper import Article, Config
-from transformers import pipeline
+try:
+    from transformers.pipelines import pipeline
+except Exception:
+    from transformers import pipeline
 from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip
 from PIL import Image, ImageDraw, ImageFont
