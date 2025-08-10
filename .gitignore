@@ -1,0 +1,5 @@
+output/
+**pycache**/
+*.pyc
+*.pyo
+*.DS_Store

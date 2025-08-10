@@ -1,0 +1,11 @@
+streamlit>=1.32,<1.37
+newspaper3k
+transformers==4.41.*
+torch==2.1.*
+gTTS
+moviepy==1.0.3
+imageio-ffmpeg
+pillow
+numpy<2.0
+feedparser
+nltk
