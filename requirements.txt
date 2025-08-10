@@ -9,3 +9,4 @@ pillow
 numpy>=2.0             #  Py 3.13 needs NumPy 2.x
 feedparser
 nltk
+lxml_html_clean
