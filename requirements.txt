@@ -12,3 +12,5 @@ feedparser
 nltk
 lxml_html_clean
 requests
+sentencepiece
+sacremoses
