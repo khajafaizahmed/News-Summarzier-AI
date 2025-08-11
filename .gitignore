@@ -1,5 +1,13 @@
-output/
-**pycache**/
+# generated media
+output/*
+archive/*
+
+# keep the archive index
+!archive/log.jsonl
+
+# python cache
+__pycache__/
 *.pyc
-*.pyo
-*.DS_Store
+
+# streamlit cache
+.streamlit/cache/
