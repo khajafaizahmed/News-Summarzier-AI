@@ -6,6 +6,9 @@ import random
 import time
 import re
 from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 import streamlit as st
 import feedparser
@@ -13,7 +16,6 @@ import numpy as np
 import requests
 from newspaper import Article, Config
 
-# transformers pipeline import (compatible across versions)
 try:
     from transformers.pipelines import pipeline
 except Exception:
@@ -23,7 +25,7 @@ from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip
 from PIL import Image, ImageDraw, ImageFont
 
-# --- Optional: ensure NLTK punkt for newspaper3k on some hosts ---
+# --- Optional NLTK punkt for newspaper3k ---
 try:
     import nltk
     try:
@@ -33,7 +35,7 @@ try:
 except Exception:
     pass
 
-# Make sure HF token is visible to the libs (no interactive login)
+# Make sure HF token (from Secrets) is visible to libs
 HF_TOKEN = st.secrets.get("HUGGINGFACE_HUB_TOKEN", os.getenv("HUGGINGFACE_HUB_TOKEN"))
 if HF_TOKEN:
     os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
@@ -101,7 +103,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # --------------------
 @st.cache_resource
 def load_summarizer():
-    # Light, CPU-friendly summarizer
     try:
         return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device=-1)
     except Exception as e:
@@ -112,32 +113,24 @@ summarizer = load_summarizer()
 
 @st.cache_resource
 def get_translator(lang_code: str):
-    """
-    Lazily load a small translation model when needed.
-    Returns None for English or if loading fails.
-    """
     if lang_code == "en":
         return None
-
     model_map = {
         "es": ("translation_en_to_es", "Helsinki-NLP/opus-mt-en-es"),
         "fr": ("translation_en_to_fr", "Helsinki-NLP/opus-mt-en-fr"),
         "it": ("translation_en_to_it", "Helsinki-NLP/opus-mt-en-it"),
         "hi": ("translation_en_to_hi", "Helsinki-NLP/opus-mt-en-hi"),
     }
-    task_model = model_map.get(lang_code)
-    if not task_model:
+    tm = model_map.get(lang_code)
+    if not tm:
         return None
-
-    task, model_name = task_model
+    task, model_name = tm
     try:
-        # Force CPU, small max length; avoid OOM and big downloads
         return pipeline(task, model=model_name, device=-1)
     except Exception as e:
         st.warning(f"Translator load failed ({type(e).__name__}): {e}")
         return None
 
-# Preload translator if needed (so first click isn’t surprising)
 if DO_TRANSLATE and VOICE_LANG != "en":
     with st.spinner("Loading translation model (first time only)…"):
         _ = get_translator(VOICE_LANG)
@@ -145,16 +138,8 @@ if DO_TRANSLATE and VOICE_LANG != "en":
 # --------------------
 # Article helpers
 # --------------------
-DENY_URL_PATTERNS = [
-    r"/news/videos/",   # BBC video pages
-    r"/news/av/",       # BBC AV pages
-    r"/video/",         # generic video pages
-    r"/live/",          # live blogs
-]
-DENY_TEXT_SNIPPETS = [
-    "not responsible for the content of external",
-    "approach to external linking",
-]
+DENY_URL_PATTERNS = [r"/news/videos/", r"/news/av/", r"/video/", r"/live/"]
+DENY_TEXT_SNIPPETS = ["not responsible for the content of external", "approach to external linking"]
 
 def looks_like_video_or_live(url: str) -> bool:
     return any(re.search(p, url) for p in DENY_URL_PATTERNS)
@@ -163,119 +148,102 @@ def is_viable_text(text: str) -> bool:
     t = (text or "").strip()
     if len(t) < 600:
         return False
-    low = t.lower()
-    return not any(snip in low for snip in DENY_TEXT_SNIPPETS)
+    return not any(s in t.lower() for s in DENY_TEXT_SNIPPETS)
 
 def fetch_html_with_retry(url, retries=2, timeout=20):
-    """Fallback fetch for sites that timeout with newspaper.download()."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; News2VideoBot/1.0; +https://streamlit.app)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; News2VideoBot/1.0; +https://streamlit.app)"}
     for i in range(retries + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            if resp.status_code == 200 and len(resp.text) > 500:
-                return resp.text
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 200 and len(r.text) > 500:
+                return r.text
         except requests.RequestException:
             pass
-        time.sleep(1.5 * (i + 1))  # simple backoff
+        time.sleep(1.5 * (i + 1))
     return None
 
 def fetch_text(url: str) -> str:
-    """Try newspaper3k first; if empty/timeout, retry with requests + set_html."""
     cfg = Config()
     cfg.request_timeout = 20
     cfg.browser_user_agent = "Mozilla/5.0 (compatible; News2VideoBot/1.0)"
     art = Article(url, config=cfg)
-
-    # First try: standard download/parse
     t = ""
     try:
-        art.download()
-        art.parse()
+        art.download(); art.parse()
         t = (art.text or "").strip()
     except Exception:
         t = ""
-
-    # Fallback: requests + set_html
     if not t:
         html = fetch_html_with_retry(url, retries=2, timeout=20)
         if html:
             try:
-                art.set_html(html)
-                art.parse()
+                art.set_html(html); art.parse()
                 t = (art.text or "").strip()
             except Exception:
                 t = ""
     return t
 
 def get_random_articles(category_feeds, count=3, max_checks=12):
-    """Return up to `count` valid articles (skip video/live/paywalled/external-link placeholders)."""
     picks, seen = [], set()
-    feeds = list(category_feeds)
-    random.shuffle(feeds)
-
+    feeds = list(category_feeds); random.shuffle(feeds)
     for feed_url in feeds:
         try:
             feed = feedparser.parse(feed_url)
-            entries = list(getattr(feed, "entries", []))
-            random.shuffle(entries)
+            entries = list(getattr(feed, "entries", [])); random.shuffle(entries)
         except Exception as e:
-            st.warning(f"Feed error ({feed_url}): {e}")
-            continue
-
+            st.warning(f"Feed error ({feed_url}): {e}"); continue
         for entry in entries:
             if len(picks) >= count or max_checks <= 0:
                 break
-
-            link = getattr(entry, "link", "")
-            title = getattr(entry, "title", "Untitled")
+            link = getattr(entry, "link", ""); title = getattr(entry, "title", "Untitled")
             source = getattr(feed.feed, "title", "Unknown Source")
-
             if not link or link in seen or looks_like_video_or_live(link):
                 continue
-
-            # Validate by fetching text quickly
-            text = fetch_text(link)
-            max_checks -= 1
+            text = fetch_text(link); max_checks -= 1
             if is_viable_text(text):
-                picks.append((link, title, source))
-                seen.add(link)
-
+                picks.append((link, title, source)); seen.add(link)
         if len(picks) >= count:
             break
-
     return picks
 
 # --------------------
 # Rendering helpers
 # --------------------
 def wrap_text_to_fit(draw, text, font, max_width):
-    """Wrap text into lines that fit within max_width."""
     words = text.split()
     lines, line = [], []
     for w in words:
         test = " ".join(line + [w])
         l, t, r, b = draw.textbbox((0, 0), test, font=font)
-        w_width = r - l
-        if w_width <= max_width:
+        if (r - l) <= max_width:
             line.append(w)
         else:
-            if line:
-                lines.append(" ".join(line))
+            if line: lines.append(" ".join(line))
             line = [w]
-    if line:
-        lines.append(" ".join(line))
+    if line: lines.append(" ".join(line))
     return lines
 
-def _load_font(size=36):
-    """Try bundled/system fonts; fall back to default."""
-    candidates = [
-        os.path.join("assets", "DejaVuSans.ttf"),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "DejaVuSans.ttf",
-        "Arial.ttf",
-    ]
+def _load_font(size=36, lang="en"):
+    """
+    Language-aware font loader so non-Latin scripts render correctly.
+    Put these files in assets/: 
+      - NotoSans-Regular.ttf (Latin)
+      - NotoSansDevanagari-Regular.ttf (Hindi)
+    """
+    # Prefer script-specific for Hindi
+    if lang == "hi":
+        candidates = [
+            os.path.join("assets", "NotoSansDevanagari-Regular.ttf"),
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        ]
+    else:
+        candidates = [
+            os.path.join("assets", "NotoSans-Regular.ttf"),
+            os.path.join("assets", "DejaVuSans.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    # Try fallbacks (system Arial etc.)
+    candidates += ["Arial.ttf"]
     for fp in candidates:
         try:
             return ImageFont.truetype(fp, size)
@@ -283,109 +251,73 @@ def _load_font(size=36):
             continue
     return ImageFont.load_default()
 
-def summary_image(summary, size=(1280, 720), margin=80):
-    """Render the summary onto a PIL image and return as BytesIO."""
+def summary_image(summary, size=(1280, 720), margin=80, lang="en"):
     img = Image.new("RGB", size, (12, 12, 12))
     draw = ImageDraw.Draw(img)
-
-    font = _load_font(36)
+    font = _load_font(36, lang=lang)
     max_text_width = size[0] - 2 * margin
     lines = wrap_text_to_fit(draw, summary, font, max_text_width)
-
-    # Correct line height
     l, t, r, b = draw.textbbox((0, 0), "Ag", font=font)
     line_height = (b - t) + 10
-    text_block_height = line_height * len(lines)
-    y = (size[1] - text_block_height) // 2
-
+    text_block_height = line_height * max(1, len(lines))
+    y = max(margin, (size[1] - text_block_height) // 2)
     for line in lines:
         l2, t2, r2, b2 = draw.textbbox((0, 0), line, font=font)
-        line_w = r2 - l2
-        x = (size[0] - line_w) // 2
+        x = max(margin, (size[0] - (r2 - l2)) // 2)
         draw.text((x, y), line, font=font, fill=(240, 240, 240))
         y += line_height
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
+    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
     return buf
 
 # --------------------
 # Core processing
 # --------------------
 def simple_fallback_summary(text: str) -> str:
-    """Very small local fallback if the HF model couldn't load (no extra deps)."""
     s = re.split(r'(?<=[.!?])\s+', text.strip())
     out, total = [], 0
     for sent in s:
-        if not sent:
-            continue
-        out.append(sent)
-        total += len(sent)
-        if len(out) >= 5 or total > 700:
-            break
+        if not sent: continue
+        out.append(sent); total += len(sent)
+        if len(out) >= 5 or total > 700: break
     return " ".join(out) if out else text[:600]
 
 def translate_text_safe(text: str, lang: str):
-    """
-    Robust translation:
-    - returns (translated_text or original, final_lang_code_for_tts)
-    - never raises (falls back to English)
-    """
     if lang == "en" or not DO_TRANSLATE:
         return text, "en"
-
     tr = get_translator(lang)
     if tr is None:
         return text, "en"
-
     try:
-        # Chunk into ~500 chars to keep memory + API happy
-        chunks, cur, limit = [], [], 500
+        chunks = []
         for para in text.split("\n"):
-            for piece in re.findall(r".{1,500}(?:\s+|$)", para):
-                chunks.append(piece.strip())
-
+            chunks += [m.group(0).strip() for m in re.finditer(r".{1,500}(?:\s+|$)", para)]
+        if not chunks:
+            chunks = [text[:500]]
         results = tr(chunks, batch_size=1, max_length=256)
-        out = " ".join([r.get("translation_text", "").strip() for r in results if r])
-        out = out.strip() or text
-        return out, lang
+        if isinstance(results, dict):   # just in case a single dict is returned
+            results = [results]
+        out = " ".join([r.get("translation_text", "").strip() for r in results if r]).strip()
+        return (out or text), lang
     except Exception as e:
         st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
         return text, "en"
 
 def process_article(url, label):
-    """
-    Scrape, summarize, (optional translate), TTS, and make video for an article.
-    Returns (video_path, summary_shown) or None.
-    """
     try:
         text = fetch_text(url)
         if not is_viable_text(text):
             return None
-
-        # Adjust summary length for short pieces
-        char_len = len(text)
-        if char_len < 800:
-            max_len, min_len = 60, 20
-        else:
-            max_len, min_len = 120, 40
-
+        max_len, min_len = (60, 20) if len(text) < 800 else (120, 40)
         if summarizer is not None:
-            summary_en = summarizer(
-                text[:4000], max_length=max_len, min_length=min_len, do_sample=False
-            )[0]["summary_text"]
+            summary_en = summarizer(text[:4000], max_length=max_len, min_length=min_len, do_sample=False)[0]["summary_text"]
         else:
             summary_en = simple_fallback_summary(text)
-
-        # Translate if needed so both on-screen text and TTS match the selection
         summary_final, tts_lang = translate_text_safe(summary_en, VOICE_LANG)
 
         uid = uuid.uuid4().hex[:8]
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
         video_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp4")
 
-        # TTS with guard
         try:
             tts = gTTS(summary_final, lang=tts_lang)
             tts.save(audio_path)
@@ -393,22 +325,14 @@ def process_article(url, label):
             st.warning(f"TTS failed: {e}")
             return None
 
-        # Render summary image -> numpy array for ImageClip
-        img_bytes = summary_image(summary_final)
+        img_bytes = summary_image(summary_final, lang=tts_lang)
         frame = np.array(Image.open(img_bytes).convert("RGB"))
 
         audio = AudioFileClip(audio_path)
         clip = ImageClip(frame).set_duration(audio.duration).set_audio(audio)
-        clip.write_videofile(
-            video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None
-        )
-
-        audio.close()
-        clip.close()
-        gc.collect()
-
+        clip.write_videofile(video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        audio.close(); clip.close(); gc.collect()
         return video_path, summary_final
-
     except Exception as e:
         st.warning(f"Error processing article: {e}")
         return None
@@ -439,16 +363,13 @@ if generate_clicked:
         st.warning("Please select at least one news region.")
     else:
         st.info("Fetching & processing… first run may take a couple of minutes (model download).")
-
         for region in region_choices:
             st.subheader(region)
             feeds = NEWS_FEEDS.get(region, [])
             articles = get_random_articles(feeds, count=vids)
             if not articles:
-                st.warning(f"No articles found right now for {region}.")
-                continue
-
-            cols = st.columns(3)  # 3 across
+                st.warning(f"No articles found right now for {region}."); continue
+            cols = st.columns(3)
             for idx, (link, title, source) in enumerate(articles, start=1):
                 col = cols[(idx - 1) % 3]
                 with col:
