@@ -48,8 +48,8 @@ st.set_page_config(page_title="Automated News to Video", page_icon="📰", layou
 st.title("📰 Automated News to Video Bot")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.write(
-    "Pick regions, language, then generate: the app fetches articles, summarizes with AI, "
-    "optionally translates, converts to speech, and produces short captioned videos."
+    "Pick regions, language, then generate: the app fetches one article, summarizes with AI, "
+    "optionally translates, converts to speech, and produces a short captioned video."
 )
 
 # --------------------
@@ -71,25 +71,14 @@ NEWS_FEEDS = {
 }
 
 region_choices = st.multiselect(
-    "News regions to include",
+    "News regions to include (we'll pick ONE good article from your selection)",
     options=list(NEWS_FEEDS.keys()),
     default=list(NEWS_FEEDS.keys()),
 )
 
-# Low-memory mode
-low_mem = st.checkbox("Low‑memory mode (smaller video, fewer items)", value=True)
-
-# Videos per region (default lower to save RAM)
-vids = st.slider("Videos per region", 1, 3, 2 if low_mem else 3, help="Reduce if the free tier feels slow.")
-
-# Frame size / fps tuned by mode
-if low_mem:
-    FRAME_SIZE = (960, 540)
-    FRAME_FPS = 20
-    vids = min(vids, 2)  # extra cap in code
-else:
-    FRAME_SIZE = (1280, 720)
-    FRAME_FPS = 24
+# Low-memory is always on for reliability (smaller frame, lower FPS)
+FRAME_SIZE = (960, 540)
+FRAME_FPS = 20
 
 seed_text = st.text_input("Random seed (optional)", help="Enter any value for reproducible picks.")
 if seed_text:
@@ -126,7 +115,7 @@ def load_summarizer():
 
 summarizer = load_summarizer()
 
-# IMPORTANT: translator is NOT cached to keep memory down
+# Translator is NOT cached (keeps memory lower)
 def get_translator(lang_code: str):
     if lang_code == "en":
         return None
@@ -194,29 +183,31 @@ def fetch_text(url: str) -> str:
                 t = ""
     return t
 
-def get_random_articles(category_feeds, count=3, max_checks=12):
-    """Return up to `count` valid articles, skipping video/live/paywalled/external-link placeholders."""
-    picks, seen = [], set()
-    feeds = list(category_feeds); random.shuffle(feeds)
-    for feed_url in feeds:
+def pick_one_article(feeds_by_region) -> tuple | None:
+    """Return a single valid (link, title, source) from the chosen regions."""
+    all_feeds = []
+    for region in feeds_by_region:
+        all_feeds.extend(NEWS_FEEDS.get(region, []))
+    random.shuffle(all_feeds)
+
+    for feed_url in all_feeds:
         try:
             feed = feedparser.parse(feed_url)
-            entries = list(getattr(feed, "entries", [])); random.shuffle(entries)
-        except Exception as e:
-            st.warning(f"Feed error ({feed_url}): {e}"); continue
+            entries = list(getattr(feed, "entries", []))
+            random.shuffle(entries)
+        except Exception:
+            continue
+
         for entry in entries:
-            if len(picks) >= count or max_checks <= 0:
-                break
-            link = getattr(entry, "link", ""); title = getattr(entry, "title", "Untitled")
+            link = getattr(entry, "link", "")
+            title = getattr(entry, "title", "Untitled")
             source = getattr(feed.feed, "title", "Unknown Source")
-            if not link or link in seen or looks_like_video_or_live(link):
+            if not link or looks_like_video_or_live(link):
                 continue
-            text = fetch_text(link); max_checks -= 1
+            text = fetch_text(link)
             if is_viable_text(text):
-                picks.append((link, title, source)); seen.add(link)
-        if len(picks) >= count:
-            break
-    return picks
+                return (link, title, source)
+    return None
 
 # --------------------
 # Rendering helpers
@@ -252,13 +243,10 @@ def _load_font(size=36, lang="en"):
             os.path.join("assets", "DejaVuSans.ttf"),
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
-
-    # Symbols fallback (won't cover letters, but can render stray glyphs)
     candidates += [
         os.path.join("assets", "NotoSansSymbols-Regular.ttf"),
-        "Arial.ttf",  # last-ditch system fallback
+        "Arial.ttf",
     ]
-
     for fp in candidates:
         try:
             if fp and os.path.exists(fp):
@@ -267,7 +255,7 @@ def _load_font(size=36, lang="en"):
             continue
     return ImageFont.load_default()
 
-def summary_image(summary, size=(1280, 720), margin=80, lang="en"):
+def summary_image(summary, size=(960, 540), margin=60, lang="en"):
     img = Image.new("RGB", size, (12, 12, 12))
     draw = ImageDraw.Draw(img)
     font = _load_font(36, lang=lang)
@@ -303,14 +291,13 @@ def translate_text_safe(text: str, lang: str, translator, do_translate: bool):
     if translator is None:
         return text, "en"
     try:
-        # chunk to avoid huge sequence RAM spikes
         chunks = []
         for para in text.split("\n"):
             chunks += [m.group(0).strip() for m in re.finditer(r".{1,500}(?:\s+|$)", para)]
         if not chunks:
             chunks = [text[:500]]
         results = translator(chunks, batch_size=1, max_length=256)
-        if isinstance(results, dict):   # just in case a single dict is returned
+        if isinstance(results, dict):
             results = [results]
         out = " ".join([r.get("translation_text", "").strip() for r in results if r]).strip()
         return (out or text), lang
@@ -318,14 +305,17 @@ def translate_text_safe(text: str, lang: str, translator, do_translate: bool):
         st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
         return text, "en"
 
-def process_article(url, label, frame_size, frame_fps, translator, do_translate, voice_lang):
+def process_article(url, label, frame_size, frame_fps, translator, do_translate, voice_lang, progress=None):
     try:
+        # Stage 1: fetch
+        if progress: progress.progress(10, text="Fetching article…")
         text = fetch_text(url)
         if not is_viable_text(text):
             return None
 
+        # Stage 2: summarize
+        if progress: progress.progress(30, text="Summarizing…")
         max_len, min_len = (60, 20) if len(text) < 800 else (120, 40)
-
         if summarizer is not None:
             summary_en = summarizer(
                 text[:4000], max_length=max_len, min_length=min_len, do_sample=False
@@ -333,13 +323,16 @@ def process_article(url, label, frame_size, frame_fps, translator, do_translate,
         else:
             summary_en = simple_fallback_summary(text)
 
+        # Stage 3: translate (optional)
+        if progress: progress.progress(50, text="Translating (if selected)…")
         summary_final, tts_lang = translate_text_safe(summary_en, voice_lang, translator, do_translate)
 
+        # Stage 4: TTS
+        if progress: progress.progress(70, text="Generating voiceover…")
         uid = uuid.uuid4().hex[:8]
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
         video_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp4")
 
-        # Cap TTS length a bit to reduce time/memory
         tts_text = summary_final.strip()
         if len(tts_text) > 1200:
             tts_text = tts_text[:1200]
@@ -351,6 +344,8 @@ def process_article(url, label, frame_size, frame_fps, translator, do_translate,
             st.warning(f"TTS failed: {e}")
             return None
 
+        # Stage 5: render video
+        if progress: progress.progress(85, text="Rendering video…")
         img_bytes = summary_image(summary_final, size=frame_size, lang=tts_lang)
         frame = np.array(Image.open(img_bytes).convert("RGB"))
 
@@ -371,6 +366,7 @@ def process_article(url, label, frame_size, frame_fps, translator, do_translate,
         del frame, audio, clip, img_bytes
         gc.collect()
 
+        if progress: progress.progress(100, text="Done!")
         return video_path, summary_final
 
     except Exception as e:
@@ -387,10 +383,10 @@ def clear_output():
 # --------------------
 # UI Controls
 # --------------------
-c1, c2 = st.columns([1, 1])
-with c1:
-    generate_clicked = st.button("Generate News Videos")
-with c2:
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    generate_clicked = st.button("Generate ONE News Video")
+with col_b:
     if st.button("Clear output"):
         clear_output()
         st.success("Output folder cleared.")
@@ -402,51 +398,52 @@ if generate_clicked:
     if not region_choices:
         st.warning("Please select at least one news region.")
     else:
-        st.info("Fetching & processing… first run may take a couple of minutes (model download).")
+        start_ts = time.perf_counter()
+        st.info("Working… first run may take a minute while models download.")
+        progress = st.progress(0, text="Starting…")
 
-        # Load ONE translator for this run, reuse, then free
+        # Load one translator just for this run (and free it at the end)
         translator = get_translator(VOICE_LANG) if (DO_TRANSLATE and VOICE_LANG != "en") else None
 
-        for region in region_choices:
-            st.subheader(region)
-            feeds = NEWS_FEEDS.get(region, [])
-            articles = get_random_articles(feeds, count=vids)
-            if not articles:
-                st.warning(f"No articles found right now for {region}.")
-                continue
-
-            cols = st.columns(3)
-            for idx, (link, title, source) in enumerate(articles, start=1):
-                col = cols[(idx - 1) % 3]
-                with col:
-                    with st.spinner(f"Processing {region} {idx}…"):
-                        result = process_article(
-                            url=link,
-                            label=f"{region.lower()}_{idx}",
-                            frame_size=FRAME_SIZE,
-                            frame_fps=FRAME_FPS,
-                            translator=translator,
-                            do_translate=DO_TRANSLATE,
-                            voice_lang=VOICE_LANG,
+        picked = pick_one_article(region_choices)
+        if not picked:
+            progress.empty()
+            st.warning("Couldn't find a suitable article right now. Try again in a moment.")
+        else:
+            link, title, source = picked
+            res = process_article(
+                url=link,
+                label="news",
+                frame_size=FRAME_SIZE,
+                frame_fps=FRAME_FPS,
+                translator=translator,
+                do_translate=DO_TRANSLATE,
+                voice_lang=VOICE_LANG,
+                progress=progress,
+            )
+            progress.empty()
+            if res:
+                video_path, summary_shown = res
+                st.markdown(f"**{title}**  \n_Source: {source}_  \n[Read article]({link})")
+                st.markdown(f"**Summary:** {summary_shown}")
+                st.video(video_path)
+                try:
+                    with open(video_path, "rb") as fh:
+                        st.download_button(
+                            label="Download Video",
+                            data=fh,
+                            file_name=os.path.basename(video_path),
+                            mime="video/mp4",
+                            key=f"dl_{os.path.basename(video_path)}",
                         )
-                        if result:
-                            video_path, summary_shown = result
-                            st.markdown(f"**{title}**  \n_Source: {source}_  \n[Read article]({link})")
-                            st.markdown(f"**Summary:** {summary_shown}")
-                            st.video(video_path)
-                            try:
-                                with open(video_path, "rb") as fh:
-                                    st.download_button(
-                                        label=f"Download Video {idx}",
-                                        data=fh,
-                                        file_name=os.path.basename(video_path),
-                                        mime="video/mp4",
-                                        key=f"dl_{region}_{idx}_{os.path.basename(video_path)}",
-                                    )
-                            except Exception:
-                                pass
-                        else:
-                            st.info("Skipped (paywalled/empty/unparsable).")
+                except Exception:
+                    pass
+            else:
+                st.info("Skipped (paywalled/empty/unparsable).")
+
+        # Elapsed time display (no ETA guesses; just what it took)
+        elapsed = time.perf_counter() - start_ts
+        st.caption(f"Elapsed: {elapsed:.1f} seconds")
 
         # Free translator memory at end of run
         translator = None
