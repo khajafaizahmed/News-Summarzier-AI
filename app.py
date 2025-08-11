@@ -114,8 +114,10 @@ def load_summarizer():
 
 summarizer = load_summarizer()
 
-@st.cache_resource
-def get_translator(lang_code: str):
+# NOTE: we intentionally DO NOT cache the translator to avoid keeping two large
+# models in memory at once. We load it only when needed and free it immediately.
+
+def load_translator(lang_code: str):
     if lang_code == "en":
         return None
     mm = {
@@ -130,14 +132,8 @@ def get_translator(lang_code: str):
     task, model = pair
     try:
         return pipeline(task, model=model, device=-1)
-    except Exception as e:
-        st.warning(f"Translator load failed ({type(e).__name__}): {e}")
+    except Exception:
         return None
-
-# Lazy pre-load to avoid surprise delay on first run
-if DO_TRANSLATE and VOICE_LANG != "en":
-    with st.spinner("Loading translation model (first time only)…"):
-        _ = get_translator(VOICE_LANG)
 
 # -----------------------------------------------------------------------------
 # Article helpers
@@ -283,11 +279,14 @@ def simple_fallback_summary(text: str) -> str:
     return " ".join(out) if out else text[:600]
 
 def translate_text_safe(text: str, lang: str):
+    """Load translator only when needed, translate, then free it to save RAM."""
     if lang == "en" or not DO_TRANSLATE:
         return text, "en"
-    tr = get_translator(lang)
+
+    tr = load_translator(lang)
     if tr is None:
         return text, "en"
+
     try:
         chunks = []
         for para in text.split("\n"):
@@ -300,21 +299,37 @@ def translate_text_safe(text: str, lang: str):
         out = " ".join([r.get("translation_text", "").strip() for r in results if r]).strip()
         return (out or text), lang
     except Exception as e:
-        st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
+        st.warning(f"Translation failed ({type(e).__name__}): using English instead.")
         return text, "en"
+    finally:
+        try:
+            del tr
+        except Exception:
+            pass
+        gc.collect()
+
+def safe_tts_save(text, lang, path):
+    """gTTS wrapper: fall back to English voice if the selected lang fails."""
+    try:
+        gTTS(text, lang=lang).save(path)
+        return True
+    except Exception as e:
+        try:
+            gTTS(text, lang="en").save(path)
+            st.warning(f"TTS failed for lang='{lang}' ({type(e).__name__}); used English voice instead.")
+            return True
+        except Exception as e2:
+            st.warning(f"TTS failed entirely ({type(e2).__name__}).")
+            return False
 
 def estimate_eta_seconds(will_translate: bool, summary_words_guess: int = 80) -> int:
     """
-    Tiny heuristic ETA (in seconds). This is intentionally conservative and cheap.
-    - Fetch/parse: ~5s
-    - Summarize: ~8s
-    - Translate (optional): +6s
-    - TTS+encode: speech length (~summary_words/160 wpm) + 4s overhead
+    Tiny heuristic ETA (in seconds). Intentionally conservative and cheap.
     """
     fetch_parse = 5
     summarize = 8 if summarizer is not None else 2
     translate = 6 if will_translate else 0
-    speech_secs = int((summary_words_guess / 160.0) * 60)  # ~160wpm
+    speech_secs = int((summary_words_guess / 160.0) * 60)  # ~160 wpm
     overhead = 4
     return fetch_parse + summarize + translate + speech_secs + overhead
 
@@ -341,8 +356,8 @@ def process_article(url, label):
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
         video_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp4")
 
-        tts = gTTS(summary_final, lang=tts_lang)
-        tts.save(audio_path)
+        if not safe_tts_save(summary_final, tts_lang, audio_path):
+            return None
 
         img_bytes = summary_image(summary_final, lang=tts_lang)
         frame = np.array(Image.open(img_bytes).convert("RGB"))
@@ -396,7 +411,7 @@ if generate_clicked:
             region_start = time.time()
             st.subheader(region)
 
-            # Quick ETA before we start (cheap guess)
+            # Cheap ETA
             eta_guess = estimate_eta_seconds(will_translate=(DO_TRANSLATE and VOICE_LANG != "en"))
             st.caption(f"Estimated time for {region}: ~{eta_guess}s")
 
