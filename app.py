@@ -20,6 +20,12 @@ from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip
 from PIL import Image, ImageDraw, ImageFont
 
+# Try to import Hugging Face login (for token-based auth)
+try:
+    from huggingface_hub import login as hf_login
+except Exception:
+    hf_login = None
+
 # Optional: ensure NLTK punkt for newspaper3k on some hosts
 try:
     import nltk
@@ -44,9 +50,6 @@ st.write(
 # --------------------
 # Controls
 # --------------------
-# Regions (International / U.S.)
-# You can select one or both.
-# Feeds below are picked to be paywall-friendly.
 NEWS_FEEDS = {
     "International": [
         "https://www.reuters.com/world/rss",
@@ -73,7 +76,6 @@ seed_text = st.text_input("Random seed (optional)", help="Enter any value for re
 if seed_text:
     random.seed(seed_text)
 
-# Language & translation options
 LANG_OPTIONS = {
     "English": "en",
     "Spanish": "es",
@@ -89,7 +91,6 @@ DO_TRANSLATE = st.checkbox(
     help="If off, summaries will stay in English even if the voice is set to another language.",
 )
 
-# Output dir
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -98,7 +99,19 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # --------------------
 @st.cache_resource
 def load_summarizer():
-    return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    # Use HF token if provided to avoid 429 rate limits
+    tok = os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if tok and hf_login:
+        try:
+            hf_login(token=tok)
+        except Exception as e:
+            st.warning(f"HF login failed: {e}")
+
+    try:
+        return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    except Exception as e:
+        st.warning(f"Hugging Face download failed ({type(e).__name__}): {e}")
+        return None  # we'll use a simple local fallback
 
 summarizer = load_summarizer()
 
@@ -297,6 +310,20 @@ def summary_image(summary, size=(1280, 720), margin=80):
 # --------------------
 # Core processing
 # --------------------
+def simple_fallback_summary(text: str) -> str:
+    """Very small local fallback if the HF model couldn't load (no extra deps)."""
+    # take first ~3-5 sentences up to ~700 chars
+    s = re.split(r'(?<=[.!?])\s+', text.strip())
+    out, total = [], 0
+    for sent in s:
+        if not sent:
+            continue
+        out.append(sent)
+        total += len(sent)
+        if len(out) >= 5 or total > 700:
+            break
+    return " ".join(out) if out else text[:600]
+
 def maybe_translate(text: str, target_lang: str, do_translate: bool) -> (str, str):
     """
     Translate `text` to `target_lang` if requested and supported.
@@ -315,7 +342,6 @@ def maybe_translate(text: str, target_lang: str, do_translate: bool) -> (str, st
     except Exception as e:
         st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
         return text, "en"
-    # Shouldn’t get here, but just in case:
     return text, "en"
 
 def process_article(url, label):
@@ -335,9 +361,12 @@ def process_article(url, label):
         else:
             max_len, min_len = 120, 40
 
-        summary_en = summarizer(
-            text[:4000], max_length=max_len, min_length=min_len, do_sample=False
-        )[0]["summary_text"]
+        if summarizer is not None:
+            summary_en = summarizer(
+                text[:4000], max_length=max_len, min_length=min_len, do_sample=False
+            )[0]["summary_text"]
+        else:
+            summary_en = simple_fallback_summary(text)
 
         # Translate if needed so both on-screen text and TTS match the selection
         summary_final, tts_lang = maybe_translate(summary_en, VOICE_LANG, DO_TRANSLATE)
