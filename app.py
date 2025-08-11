@@ -6,6 +6,12 @@ import random
 import time
 import re
 from datetime import datetime
+import warnings
+
+# Quiet the noisy library warnings in logs
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+# Optional: also hide deprecation chatter
+# warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import streamlit as st
 import feedparser
@@ -312,7 +318,6 @@ def summary_image(summary, size=(1280, 720), margin=80):
 # --------------------
 def simple_fallback_summary(text: str) -> str:
     """Very small local fallback if the HF model couldn't load (no extra deps)."""
-    # take first ~3-5 sentences up to ~700 chars
     s = re.split(r'(?<=[.!?])\s+', text.strip())
     out, total = [], 0
     for sent in s:
