@@ -121,6 +121,11 @@ def get_translator(lang_code: str):
         return None
     return pipeline("translation", model=model_name)
 
+# Preload translator if needed (so the first run doesn’t surprise users)
+if DO_TRANSLATE and VOICE_LANG != "en":
+    with st.spinner("Loading translation model (first time only)…"):
+        _ = get_translator(VOICE_LANG)
+
 # --------------------
 # Article helpers
 # --------------------
@@ -307,10 +312,10 @@ def maybe_translate(text: str, target_lang: str, do_translate: bool) -> (str, st
         out = translator(text[:2000])[0]["translation_text"]
         if (out or "").strip():
             return out, target_lang
-    except Exception:
-        pass
-    # Fallback if translation fails
-    st.warning("Translation failed; using English instead.")
+    except Exception as e:
+        st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
+        return text, "en"
+    # Shouldn’t get here, but just in case:
     return text, "en"
 
 def process_article(url, label):
