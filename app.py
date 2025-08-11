@@ -226,11 +226,8 @@ def wrap_text_to_fit(draw, text, font, max_width):
 def _load_font(size=36, lang="en"):
     """
     Language-aware font loader so non-Latin scripts render correctly.
-    Put these files in assets/: 
-      - NotoSans-Regular.ttf (Latin)
-      - NotoSansDevanagari-Regular.ttf (Hindi)
+    Looks in assets/ first, then common system paths.
     """
-    # Prefer script-specific for Hindi
     if lang == "hi":
         candidates = [
             os.path.join("assets", "NotoSansDevanagari-Regular.ttf"),
@@ -239,14 +236,21 @@ def _load_font(size=36, lang="en"):
     else:
         candidates = [
             os.path.join("assets", "NotoSans-Regular.ttf"),
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             os.path.join("assets", "DejaVuSans.ttf"),
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
-    # Try fallbacks (system Arial etc.)
-    candidates += ["Arial.ttf"]
+
+    # Symbols fallback (doesn't cover letters, but can render stray glyphs)
+    candidates += [
+        os.path.join("assets", "NotoSansSymbols-Regular.ttf"),
+        "Arial.ttf",  # last-ditch system fallback
+    ]
+
     for fp in candidates:
         try:
-            return ImageFont.truetype(fp, size)
+            if fp and os.path.exists(fp):
+                return ImageFont.truetype(fp, size)
         except Exception:
             continue
     return ImageFont.load_default()
