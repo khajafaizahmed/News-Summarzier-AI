@@ -37,38 +37,64 @@ st.set_page_config(page_title="Automated News to Video", page_icon="📰", layou
 st.title("📰 Automated News to Video Bot")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.write(
-    "Fetches random hard & soft news, summarizes with AI, converts to speech, "
-    "and generates short videos with on-screen captions."
+    "Pick regions, language, then generate: the app fetches articles, summarizes with AI, "
+    "optionally translates, converts to speech, and produces short captioned videos."
 )
 
+# --------------------
 # Controls
-vids = st.slider("Videos per category", 1, 3, 3, help="Reduce if the free tier feels slow.")
+# --------------------
+# Regions (International / U.S.)
+# You can select one or both.
+# Feeds below are picked to be paywall-friendly.
+NEWS_FEEDS = {
+    "International": [
+        "https://www.reuters.com/world/rss",
+        "https://feeds.apnews.com/apf-worldnews",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.theguardian.com/world/rss",
+    ],
+    "U.S.": [
+        "https://www.reuters.com/world/us/rss",
+        "https://feeds.apnews.com/apf-usnews",
+        "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml",
+        "https://feeds.npr.org/1001/rss.xml",  # U.S./Top Stories
+    ],
+}
+
+region_choices = st.multiselect(
+    "News regions to include",
+    options=list(NEWS_FEEDS.keys()),
+    default=list(NEWS_FEEDS.keys()),
+)
+
+vids = st.slider("Videos per region", 1, 3, 3, help="Reduce if the free tier feels slow.")
 seed_text = st.text_input("Random seed (optional)", help="Enter any value for reproducible picks.")
 if seed_text:
     random.seed(seed_text)
 
-# --------------------
-# Paywall-friendly RSS feeds
-# --------------------
-NEWS_FEEDS = {
-    "Hard News": [
-        "https://www.reuters.com/world/rss",
-        "https://feeds.apnews.com/apf-topnews",
-        "https://feeds.npr.org/1004/rss.xml",
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-    ],
-    "Soft News": [
-        "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-        "https://www.theguardian.com/film/rss",
-        "https://www.theguardian.com/music/rss",
-    ],
+# Language & translation options
+LANG_OPTIONS = {
+    "English": "en",
+    "Spanish": "es",
+    "Hindi": "hi",
+    "French": "fr",
+    "Italian": "it",
 }
+voice_label = st.selectbox("Voice / Summary language", list(LANG_OPTIONS.keys()), index=0)
+VOICE_LANG = LANG_OPTIONS[voice_label]
+DO_TRANSLATE = st.checkbox(
+    "Translate the summary text to the selected language",
+    value=(VOICE_LANG != "en"),
+    help="If off, summaries will stay in English even if the voice is set to another language.",
+)
 
+# Output dir
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------------
-# Cache model (lighter than bart-large)
+# Models (cached)
 # --------------------
 @st.cache_resource
 def load_summarizer():
@@ -76,8 +102,27 @@ def load_summarizer():
 
 summarizer = load_summarizer()
 
+@st.cache_resource
+def get_translator(lang_code: str):
+    """
+    Lazily load a small translation model when needed.
+    Returns None for English.
+    """
+    if lang_code == "en":
+        return None
+    model_map = {
+        "es": "Helsinki-NLP/opus-mt-en-es",
+        "fr": "Helsinki-NLP/opus-mt-en-fr",
+        "it": "Helsinki-NLP/opus-mt-en-it",
+        "hi": "Helsinki-NLP/opus-mt-en-hi",
+    }
+    model_name = model_map.get(lang_code)
+    if not model_name:
+        return None
+    return pipeline("translation", model=model_name)
+
 # --------------------
-# Helpers
+# Article helpers
 # --------------------
 DENY_URL_PATTERNS = [
     r"/news/videos/",   # BBC video pages
@@ -181,6 +226,9 @@ def get_random_articles(category_feeds, count=3, max_checks=12):
 
     return picks
 
+# --------------------
+# Rendering helpers
+# --------------------
 def wrap_text_to_fit(draw, text, font, max_width):
     """Wrap text into lines that fit within max_width."""
     words = text.split()
@@ -241,10 +289,34 @@ def summary_image(summary, size=(1280, 720), margin=80):
     buf.seek(0)
     return buf
 
+# --------------------
+# Core processing
+# --------------------
+def maybe_translate(text: str, target_lang: str, do_translate: bool) -> (str, str):
+    """
+    Translate `text` to `target_lang` if requested and supported.
+    Returns (final_text, final_lang_for_tts).
+    If translation fails, falls back to English text + 'en' voice.
+    """
+    if not do_translate or target_lang == "en":
+        return text, "en"
+    try:
+        translator = get_translator(target_lang)
+        if translator is None:
+            return text, "en"
+        out = translator(text[:2000])[0]["translation_text"]
+        if (out or "").strip():
+            return out, target_lang
+    except Exception:
+        pass
+    # Fallback if translation fails
+    st.warning("Translation failed; using English instead.")
+    return text, "en"
+
 def process_article(url, label):
     """
-    Scrape, summarize, TTS, and make video for an article.
-    Returns (video_path, summary) or None.
+    Scrape, summarize, (optional translate), TTS, and make video for an article.
+    Returns (video_path, summary_shown) or None.
     """
     try:
         text = fetch_text(url)
@@ -258,9 +330,12 @@ def process_article(url, label):
         else:
             max_len, min_len = 120, 40
 
-        summary = summarizer(
+        summary_en = summarizer(
             text[:4000], max_length=max_len, min_length=min_len, do_sample=False
         )[0]["summary_text"]
+
+        # Translate if needed so both on-screen text and TTS match the selection
+        summary_final, tts_lang = maybe_translate(summary_en, VOICE_LANG, DO_TRANSLATE)
 
         uid = uuid.uuid4().hex[:8]
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
@@ -268,14 +343,14 @@ def process_article(url, label):
 
         # TTS with guard
         try:
-            tts = gTTS(summary)
+            tts = gTTS(summary_final, lang=tts_lang)
             tts.save(audio_path)
         except Exception as e:
             st.warning(f"TTS failed: {e}")
             return None
 
         # Render summary image -> numpy array for ImageClip
-        img_bytes = summary_image(summary)
+        img_bytes = summary_image(summary_final)
         frame = np.array(Image.open(img_bytes).convert("RGB"))
 
         audio = AudioFileClip(audio_path)
@@ -288,7 +363,7 @@ def process_article(url, label):
         clip.close()
         gc.collect()
 
-        return video_path, summary
+        return video_path, summary_final
 
     except Exception as e:
         st.warning(f"Error processing article: {e}")
@@ -312,37 +387,44 @@ with c2:
         clear_output()
         st.success("Output folder cleared.")
 
+# --------------------
+# Main
+# --------------------
 if generate_clicked:
-    st.info("Fetching & processing… first run may take a couple of minutes (model download).")
+    if not region_choices:
+        st.warning("Please select at least one news region.")
+    else:
+        st.info("Fetching & processing… first run may take a couple of minutes (model download).")
 
-    for category, feeds in NEWS_FEEDS.items():
-        st.subheader(category)
-        articles = get_random_articles(feeds, count=vids)
-        if not articles:
-            st.warning("No articles found for this category right now.")
-            continue
+        for region in region_choices:
+            st.subheader(region)
+            feeds = NEWS_FEEDS.get(region, [])
+            articles = get_random_articles(feeds, count=vids)
+            if not articles:
+                st.warning(f"No articles found right now for {region}.")
+                continue
 
-        cols = st.columns(3)  # 3 across
-        for idx, (link, title, source) in enumerate(articles, start=1):
-            col = cols[(idx - 1) % 3]
-            with col:
-                with st.spinner(f"Processing {category} {idx}…"):
-                    result = process_article(link, f"{category.lower()}_{idx}")
-                    if result:
-                        video_path, summary = result
-                        st.markdown(f"**{title}**  \n_Source: {source}_  \n[Read article]({link})")
-                        st.markdown(f"**Summary:** {summary}")
-                        st.video(video_path)
-                        try:
-                            with open(video_path, "rb") as fh:
-                                st.download_button(
-                                    label=f"Download Video {idx}",
-                                    data=fh,
-                                    file_name=os.path.basename(video_path),
-                                    mime="video/mp4",
-                                    key=f"dl_{category}_{idx}_{os.path.basename(video_path)}",
-                                )
-                        except Exception:
-                            pass
-                    else:
-                        st.info("Skipped (paywalled/empty/unparsable).")
+            cols = st.columns(3)  # 3 across
+            for idx, (link, title, source) in enumerate(articles, start=1):
+                col = cols[(idx - 1) % 3]
+                with col:
+                    with st.spinner(f"Processing {region} {idx}…"):
+                        result = process_article(link, f"{region.lower()}_{idx}")
+                        if result:
+                            video_path, summary_shown = result
+                            st.markdown(f"**{title}**  \n_Source: {source}_  \n[Read article]({link})")
+                            st.markdown(f"**Summary:** {summary_shown}")
+                            st.video(video_path)
+                            try:
+                                with open(video_path, "rb") as fh:
+                                    st.download_button(
+                                        label=f"Download Video {idx}",
+                                        data=fh,
+                                        file_name=os.path.basename(video_path),
+                                        mime="video/mp4",
+                                        key=f"dl_{region}_{idx}_{os.path.basename(video_path)}",
+                                    )
+                            except Exception:
+                                pass
+                        else:
+                            st.info("Skipped (paywalled/empty/unparsable).")
