@@ -47,8 +47,9 @@ st.set_page_config(page_title="Automated News to Video", page_icon="📰", layou
 st.title("📰 Automated News to Video Bot")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.write(
-    "Pick regions + language, then generate one short video: the app fetches an article, "
-    "summarizes with AI, optionally translates, converts to speech, and renders on-screen captions."
+    "Pick regions + language, then generate up to two short videos (one per region): "
+    "the app fetches an article, summarizes with AI, optionally translates, converts to speech, "
+    "and renders on-screen captions."
 )
 
 # --------------------
@@ -70,9 +71,9 @@ NEWS_FEEDS = {
 }
 
 region_choices = st.multiselect(
-    "News regions to include (we’ll pick ONE article from these)",
+    "Which regions to generate? (one video per region)",
     options=list(NEWS_FEEDS.keys()),
-    default=list(NEWS_FEEDS.keys()),
+    default=list(NEWS_FEEDS.keys()),  # both
 )
 
 seed_text = st.text_input("Random seed (optional)", help="Enter any value for reproducible picks.")
@@ -130,7 +131,7 @@ def get_translator(lang_code: str):
         st.warning(f"Translator load failed ({type(e).__name__}): {e}")
         return None
 
-# Preload translator only if needed
+# Preload translator only if needed (to avoid surprise delay)
 if DO_TRANSLATE and VOICE_LANG != "en":
     with st.spinner("Loading translation model (first time only)…"):
         _ = get_translator(VOICE_LANG)
@@ -183,15 +184,12 @@ def fetch_text(url: str) -> str:
                 t = ""
     return t
 
-def sample_one_article_from_regions(selected_regions):
-    """Pick ONE viable (non-video/live) article across all selected regions."""
-    pool = []
-    for region in selected_regions:
-        pool.extend(NEWS_FEEDS.get(region, []))
-    random.shuffle(pool)
-
-    max_checks = 12
-    for feed_url in pool:
+def pick_one_article(region_name: str):
+    """Pick a single viable article from a region or return None."""
+    feeds = list(NEWS_FEEDS.get(region_name, []))
+    random.shuffle(feeds)
+    checks_left = 10
+    for feed_url in feeds:
         try:
             feed = feedparser.parse(feed_url)
             entries = list(getattr(feed, "entries", []))
@@ -200,7 +198,7 @@ def sample_one_article_from_regions(selected_regions):
             continue
 
         for entry in entries:
-            if max_checks <= 0:
+            if checks_left <= 0:
                 break
             link = getattr(entry, "link", "")
             title = getattr(entry, "title", "Untitled")
@@ -208,7 +206,7 @@ def sample_one_article_from_regions(selected_regions):
             if not link or looks_like_video_or_live(link):
                 continue
             text = fetch_text(link)
-            max_checks -= 1
+            checks_left -= 1
             if is_viable_text(text):
                 return (link, title, source)
     return None
@@ -376,7 +374,7 @@ def clear_output():
 # --------------------
 c1, c2 = st.columns([1, 1])
 with c1:
-    generate_clicked = st.button("Generate 1 News Video")
+    generate_clicked = st.button("Generate Videos (one per region)")
 with c2:
     if st.button("Clear output"):
         clear_output()
@@ -386,39 +384,44 @@ with c2:
 # Main
 # --------------------
 if generate_clicked:
-    start_ts = time.time()
-
     if not region_choices:
         st.warning("Please select at least one news region.")
     else:
         st.info("Fetching & processing… first run may take a couple of minutes (model download).")
 
-        pick = sample_one_article_from_regions(region_choices)
-        if not pick:
-            st.warning("No viable article found. Please try again.")
-        else:
+        # We’ll generate sequentially per region to keep memory stable.
+        for region in region_choices:
+            region_start = time.time()
+            st.subheader(region)
+
+            pick = pick_one_article(region)
+            if not pick:
+                st.warning(f"No viable article found for {region}.")
+                continue
+
             link, title, source = pick
             with st.spinner("Summarizing, translating (if selected), and rendering video…"):
-                result = process_article(link, "news_one")
+                result = process_article(link, f"{region.lower()}")
+
             if result:
                 video_path, summary_shown = result
-                st.subheader("Your Video")
                 st.markdown(f"**{title}**  \n_Source: {source}_  \n[Read article]({link})")
                 st.markdown(f"**Summary:** {summary_shown}")
                 st.video(video_path)
                 try:
                     with open(video_path, "rb") as fh:
                         st.download_button(
-                            label="Download Video",
+                            label=f"Download {region} Video",
                             data=fh,
                             file_name=os.path.basename(video_path),
                             mime="video/mp4",
-                            key=f"dl_one_{os.path.basename(video_path)}",
+                            key=f"dl_{region}_{os.path.basename(video_path)}",
                         )
                 except Exception:
                     pass
             else:
                 st.info("Skipped (paywalled/empty/unparsable).")
 
-    elapsed = time.time() - start_ts
-    st.caption(f"⏱️ Completed in {elapsed:.1f} seconds.")
+            st.caption(f"⏱️ {region} video completed in {time.time() - region_start:.1f} seconds.")
+            # Encourage GC between regions
+            gc.collect()
