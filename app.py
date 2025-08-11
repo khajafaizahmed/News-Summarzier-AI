@@ -6,33 +6,24 @@ import random
 import time
 import re
 from datetime import datetime
-import warnings
-
-# Quiet the noisy library warnings in logs
-warnings.filterwarnings("ignore", category=SyntaxWarning)
-# Optional: also hide deprecation chatter
-# warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import streamlit as st
 import feedparser
 import numpy as np
 import requests
 from newspaper import Article, Config
+
+# transformers pipeline import (compatible across versions)
 try:
     from transformers.pipelines import pipeline
 except Exception:
     from transformers import pipeline
+
 from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip
 from PIL import Image, ImageDraw, ImageFont
 
-# Try to import Hugging Face login (for token-based auth)
-try:
-    from huggingface_hub import login as hf_login
-except Exception:
-    hf_login = None
-
-# Optional: ensure NLTK punkt for newspaper3k on some hosts
+# --- Optional: ensure NLTK punkt for newspaper3k on some hosts ---
 try:
     import nltk
     try:
@@ -41,6 +32,11 @@ try:
         nltk.download("punkt", quiet=True)
 except Exception:
     pass
+
+# Make sure HF token is visible to the libs (no interactive login)
+HF_TOKEN = st.secrets.get("HUGGINGFACE_HUB_TOKEN", os.getenv("HUGGINGFACE_HUB_TOKEN"))
+if HF_TOKEN:
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
 
 # --------------------
 # Page Setup
@@ -67,7 +63,7 @@ NEWS_FEEDS = {
         "https://www.reuters.com/world/us/rss",
         "https://feeds.apnews.com/apf-usnews",
         "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml",
-        "https://feeds.npr.org/1001/rss.xml",  # U.S./Top Stories
+        "https://feeds.npr.org/1001/rss.xml",
     ],
 }
 
@@ -105,19 +101,12 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # --------------------
 @st.cache_resource
 def load_summarizer():
-    # Use HF token if provided to avoid 429 rate limits
-    tok = os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if tok and hf_login:
-        try:
-            hf_login(token=tok)
-        except Exception as e:
-            st.warning(f"HF login failed: {e}")
-
+    # Light, CPU-friendly summarizer
     try:
-        return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+        return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device=-1)
     except Exception as e:
-        st.warning(f"Hugging Face download failed ({type(e).__name__}): {e}")
-        return None  # we'll use a simple local fallback
+        st.warning(f"Hugging Face download failed ({type(e).__name__}): {e}. Using a local fallback summary.")
+        return None
 
 summarizer = load_summarizer()
 
@@ -125,22 +114,30 @@ summarizer = load_summarizer()
 def get_translator(lang_code: str):
     """
     Lazily load a small translation model when needed.
-    Returns None for English.
+    Returns None for English or if loading fails.
     """
     if lang_code == "en":
         return None
-    model_map = {
-        "es": "Helsinki-NLP/opus-mt-en-es",
-        "fr": "Helsinki-NLP/opus-mt-en-fr",
-        "it": "Helsinki-NLP/opus-mt-en-it",
-        "hi": "Helsinki-NLP/opus-mt-en-hi",
-    }
-    model_name = model_map.get(lang_code)
-    if not model_name:
-        return None
-    return pipeline("translation", model=model_name)
 
-# Preload translator if needed (so the first run doesn’t surprise users)
+    model_map = {
+        "es": ("translation_en_to_es", "Helsinki-NLP/opus-mt-en-es"),
+        "fr": ("translation_en_to_fr", "Helsinki-NLP/opus-mt-en-fr"),
+        "it": ("translation_en_to_it", "Helsinki-NLP/opus-mt-en-it"),
+        "hi": ("translation_en_to_hi", "Helsinki-NLP/opus-mt-en-hi"),
+    }
+    task_model = model_map.get(lang_code)
+    if not task_model:
+        return None
+
+    task, model_name = task_model
+    try:
+        # Force CPU, small max length; avoid OOM and big downloads
+        return pipeline(task, model=model_name, device=-1)
+    except Exception as e:
+        st.warning(f"Translator load failed ({type(e).__name__}): {e}")
+        return None
+
+# Preload translator if needed (so first click isn’t surprising)
 if DO_TRANSLATE and VOICE_LANG != "en":
     with st.spinner("Loading translation model (first time only)…"):
         _ = get_translator(VOICE_LANG)
@@ -329,25 +326,33 @@ def simple_fallback_summary(text: str) -> str:
             break
     return " ".join(out) if out else text[:600]
 
-def maybe_translate(text: str, target_lang: str, do_translate: bool) -> (str, str):
+def translate_text_safe(text: str, lang: str):
     """
-    Translate `text` to `target_lang` if requested and supported.
-    Returns (final_text, final_lang_for_tts).
-    If translation fails, falls back to English text + 'en' voice.
+    Robust translation:
+    - returns (translated_text or original, final_lang_code_for_tts)
+    - never raises (falls back to English)
     """
-    if not do_translate or target_lang == "en":
+    if lang == "en" or not DO_TRANSLATE:
         return text, "en"
+
+    tr = get_translator(lang)
+    if tr is None:
+        return text, "en"
+
     try:
-        translator = get_translator(target_lang)
-        if translator is None:
-            return text, "en"
-        out = translator(text[:2000])[0]["translation_text"]
-        if (out or "").strip():
-            return out, target_lang
+        # Chunk into ~500 chars to keep memory + API happy
+        chunks, cur, limit = [], [], 500
+        for para in text.split("\n"):
+            for piece in re.findall(r".{1,500}(?:\s+|$)", para):
+                chunks.append(piece.strip())
+
+        results = tr(chunks, batch_size=1, max_length=256)
+        out = " ".join([r.get("translation_text", "").strip() for r in results if r])
+        out = out.strip() or text
+        return out, lang
     except Exception as e:
         st.warning(f"Translation failed ({type(e).__name__}): {e}. Using English instead.")
         return text, "en"
-    return text, "en"
 
 def process_article(url, label):
     """
@@ -374,7 +379,7 @@ def process_article(url, label):
             summary_en = simple_fallback_summary(text)
 
         # Translate if needed so both on-screen text and TTS match the selection
-        summary_final, tts_lang = maybe_translate(summary_en, VOICE_LANG, DO_TRANSLATE)
+        summary_final, tts_lang = translate_text_safe(summary_en, VOICE_LANG)
 
         uid = uuid.uuid4().hex[:8]
         audio_path = os.path.join(OUTPUT_DIR, f"{label}_{uid}.mp3")
