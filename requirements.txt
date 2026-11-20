@@ -1,12 +1,12 @@
-streamlit>=1.32,<1.37
+streamlit>=1.67,<2
 newspaper3k
-transformers==4.41.2
-tokenizers==0.19.1
-torch==2.5.1
+transformers==4.57.6      # newest 4.x; 5.x removes the summarization/translation pipelines
+tokenizers>=0.22,<0.23
+torch==2.15.0
 gTTS
 moviepy==1.0.3        # revert to 1.x (has moviepy.editor)
 imageio-ffmpeg
-pillow
+pillow>=13.0.0
 numpy<2.0              # required for moviepy 1.x
 feedparser
 nltk
